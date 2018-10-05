@@ -12,11 +12,97 @@ import (
 	"strconv"
 	"time"
 
+	"flag"
+
+	"os"
+
 	"github.com/boltdb/bolt"
 )
 
 const targetBits = 12
 const maxNonce = math.MaxInt64
+const dbFile = "blockchain.db"
+const blocksBucket = "blocks"
+
+type CLI struct {
+	bc *Blockchain
+}
+
+func (cli *CLI) validateArgs() {
+	if len(os.Args) < 2 {
+		cli.printUsage()
+		os.Exit(1)
+	}
+}
+
+func (cli *CLI) printUsage() {
+	fmt.Println("Usage:")
+	fmt.Println("  add -data BLOCK_DATA - add to blockchain")
+	fmt.Println("  print - print all blocks")
+}
+
+func (cli *CLI) Run() {
+	cli.validateArgs()
+
+	addBlockCmd := flag.NewFlagSet("add", flag.ExitOnError)
+	printChainCmd := flag.NewFlagSet("print", flag.ExitOnError)
+
+	addBlockData := addBlockCmd.String("data", "", "Block data")
+
+	switch os.Args[1] {
+	case "add":
+		err := addBlockCmd.Parse(os.Args[2:])
+
+		if err != nil {
+			log.Panic(err)
+		}
+	case "print":
+		err := printChainCmd.Parse(os.Args[2:])
+
+		if err != nil {
+			log.Panic(err)
+		}
+	default:
+		cli.printUsage()
+		os.Exit(1)
+	}
+
+	if addBlockCmd.Parsed() {
+		if *addBlockData == "" {
+			addBlockCmd.Usage()
+			os.Exit(1)
+		}
+		cli.addBlock(*addBlockData)
+	}
+
+	if printChainCmd.Parsed() {
+		cli.printChain()
+	}
+}
+
+func (cli *CLI) addBlock(data string) {
+	cli.bc.AddBlock(data)
+	fmt.Println("Success!")
+}
+
+func (cli *CLI) printChain() {
+	bci := cli.bc.Iterator()
+
+	for {
+		block := bci.Next()
+
+		fmt.Printf("Prev. hash: %x\n", block.PrevBlockHash)
+		fmt.Printf("Data: %s\n", block.Data)
+		fmt.Printf("Hash: %x\n", block.Hash)
+		pow := NewProofOfWork(block)
+		fmt.Printf("PoW: %s\n", strconv.FormatBool(pow.Validate()))
+		fmt.Println()
+
+		if len(block.PrevBlockHash) == 0 {
+			break
+		}
+	}
+}
 
 type ProofOfWork struct {
 	block  *Block
@@ -62,7 +148,7 @@ func (pow *ProofOfWork) Run() (int, []byte) {
 	fmt.Printf("Mining the block containing \"%s\"\n", pow.block.Data)
 	for nonce < maxNonce {
 		data := pow.prepareData(nonce)
-		hash := sha256.Sum256(data)
+		hash = sha256.Sum256(data)
 		fmt.Printf("\r%x", hash)
 		hashInt.SetBytes(hash[:])
 		if hashInt.Cmp(pow.target) == -1 {
@@ -113,7 +199,7 @@ func (b *Block) Serialize() []byte {
 func DeserializeBlock(d []byte) *Block {
 	var block Block
 	decoder := gob.NewDecoder(bytes.NewReader(d))
-	err := decoder.Decode(block)
+	err := decoder.Decode(&block)
 	if err != nil {
 		log.Panic(err)
 	}
@@ -151,15 +237,18 @@ func (i *BlockchainIterator) Next() *Block {
 		return nil
 	})
 
+	if err != nil {
+		log.Panic(err)
+	}
+
 	i.currentHash = block.PrevBlockHash
 
 	return block
 }
 
 type Blockchain struct {
-	blocks []*Block
-	tip    []byte
-	db     *bolt.DB
+	tip []byte
+	db  *bolt.DB
 }
 
 func (bc *Blockchain) Iterator() *BlockchainIterator {
@@ -177,12 +266,24 @@ func (bc *Blockchain) AddBlock(data string) {
 		return nil
 	})
 
+	if err != nil {
+		log.Panic(err)
+	}
+
 	newBlock := NewBlock(data, lastHash)
 
 	err = bc.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(blocksBucket))
 		err := b.Put(newBlock.Hash, newBlock.Serialize())
+
+		if err != nil {
+			log.Panic(err)
+		}
 		err = b.Put([]byte("l"), newBlock.Hash)
+
+		if err != nil {
+			log.Panic(err)
+		}
 		bc.tip = newBlock.Hash
 
 		return nil
@@ -193,14 +294,29 @@ func NewBlockchain() *Blockchain {
 	var tip []byte
 	db, err := bolt.Open(dbFile, 0600, nil)
 
+	if err != nil {
+		log.Panic(err)
+	}
 	err = db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(blocksBucket))
 
 		if b == nil {
 			genesis := NewGenesisBlock()
 			b, err := tx.CreateBucket([]byte(blocksBucket))
+
+			if err != nil {
+				log.Panic(err)
+			}
 			err = b.Put(genesis.Hash, genesis.Serialize())
+
+			if err != nil {
+				log.Panic(err)
+			}
 			err = b.Put([]byte("l"), genesis.Hash)
+
+			if err != nil {
+				log.Panic(err)
+			}
 			tip = genesis.Hash
 		} else {
 			tip = b.Get([]byte("l"))
@@ -215,17 +331,8 @@ func NewBlockchain() *Blockchain {
 func main() {
 	bc := NewBlockchain()
 
-	bc.AddBlock("Send 1 euro to Anatoly")
-	bc.AddBlock("send more because he poor")
+	defer bc.db.Close()
 
-	for _, block := range bc.blocks {
-		fmt.Printf("Prev. hash: %x\n", block.PrevBlockHash)
-		fmt.Printf("Data: %s\n", block.Data)
-		fmt.Printf("Hash: %x\n", block.Hash)
-		fmt.Println()
-
-		pow := NewProofOfWork(block)
-		fmt.Printf("PoW: %s\n", strconv.FormatBool(pow.Validate()))
-		fmt.Println()
-	}
+	cli := CLI{bc}
+	cli.Run()
 }
